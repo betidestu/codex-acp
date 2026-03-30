@@ -506,6 +506,8 @@ impl Agent for CodexAgent {
         .await
         .map_err(|err| Error::internal_error().data(format!("failed to list sessions: {err}")))?;
 
+        info!("list_sessions: {} items from list_threads, filter cwd={:?}", page.items.len(), cwd.as_ref().map(|p| p.display().to_string()));
+
         // Normalize filter cwd for platform-independent comparison.
         // On Windows, AIK sends forward slashes but Codex stores backslashes (or vice versa),
         // and drive letter casing can differ. Normalize both sides to avoid false mismatches.
@@ -530,6 +532,7 @@ impl Agent for CodexAgent {
                     let filter_trimmed = filter.trim_end_matches('/');
                     let item_trimmed = item_normalized.trim_end_matches('/');
                     if filter_trimmed != item_trimmed {
+                        info!("list_sessions: cwd mismatch — filter='{}' item='{}'", filter_trimmed, item_trimmed);
                         return None;
                     }
                 }
