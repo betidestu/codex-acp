@@ -4,7 +4,7 @@ use agent_client_protocol::{
     ClientCapabilities, CloseSessionRequest, CloseSessionResponse, Error, Implementation,
     InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
     LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer, McpServerHttp,
-    McpServerStdio, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest,
+    McpServerStdio, Meta, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest,
     PromptResponse, ProtocolVersion, SessionCapabilities, SessionCloseCapabilities, SessionId,
     SessionInfo, SessionListCapabilities, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
@@ -125,16 +125,49 @@ impl CodexAgent {
         Ok(())
     }
 
-    /// Build a session config from base config, working directory, and MCP servers.
+    /// Extract systemPrompt from ACP _meta field.
+    /// Supports both `{ "systemPrompt": "string" }` and `{ "systemPrompt": { "append": "string" } }`.
+    fn extract_system_prompt(meta: &Option<Meta>) -> Option<String> {
+        let prompt = meta.as_ref()?.get("systemPrompt")?;
+        if let Some(s) = prompt.as_str() {
+            if !s.is_empty() {
+                return Some(s.to_owned());
+            }
+        }
+        if let Some(obj) = prompt.as_object() {
+            if let Some(s) = obj.get("append").and_then(|v| v.as_str()) {
+                if !s.is_empty() {
+                    return Some(s.to_owned());
+                }
+            }
+        }
+        None
+    }
+
+    /// Build a session config from base config, working directory, MCP servers, and optional _meta.
     /// This is shared between `new_session` and `load_session`.
     fn build_session_config(
         &self,
         cwd: &PathBuf,
         mcp_servers: Vec<McpServer>,
+        meta: &Option<Meta>,
     ) -> Result<Config, Error> {
         let mut config = self.config.clone();
         config.include_apply_patch_tool = true;
         config.cwd.clone_from(cwd);
+
+        // Inject client-provided system prompt as developer instructions.
+        // This allows ACP clients (like Agent Integration Kit) to pass custom instructions
+        // via _meta.systemPrompt that Codex will include as a developer-role message.
+        if let Some(prompt) = Self::extract_system_prompt(meta) {
+            let existing = config.developer_instructions.take().unwrap_or_default();
+            config.developer_instructions = Some(if existing.is_empty() {
+                prompt
+            } else {
+                format!("{existing}\n\n{prompt}")
+            });
+            info!("Injected client system prompt as developer instructions");
+        }
 
         // Propagate any client-provided MCP servers that codex-rs supports.
         let mut new_mcp_servers = config.mcp_servers.get().clone();
@@ -333,11 +366,11 @@ impl Agent for CodexAgent {
         self.check_auth().await?;
 
         let NewSessionRequest {
-            cwd, mcp_servers, ..
+            cwd, mcp_servers, meta, ..
         } = request;
         info!("Creating new session with cwd: {}", cwd.display());
 
-        let config = self.build_session_config(&cwd, mcp_servers)?;
+        let config = self.build_session_config(&cwd, mcp_servers, &meta)?;
         let num_mcp_servers = config.mcp_servers.len();
 
         let NewThread {
@@ -388,6 +421,7 @@ impl Agent for CodexAgent {
             session_id,
             cwd,
             mcp_servers,
+            meta,
             ..
         } = request;
 
@@ -407,7 +441,7 @@ impl Agent for CodexAgent {
             InitialHistory::New => Vec::new(),
         };
 
-        let config = self.build_session_config(&cwd, mcp_servers)?;
+        let config = self.build_session_config(&cwd, mcp_servers, &meta)?;
 
         let NewThread {
             thread_id: _,
@@ -472,6 +506,14 @@ impl Agent for CodexAgent {
         .await
         .map_err(|err| Error::internal_error().data(format!("failed to list sessions: {err}")))?;
 
+        // Normalize filter cwd for platform-independent comparison.
+        // On Windows, AIK sends forward slashes but Codex stores backslashes (or vice versa),
+        // and drive letter casing can differ. Normalize both sides to avoid false mismatches.
+        let normalized_filter_cwd = cwd.as_ref().map(|p| {
+            let s = p.to_string_lossy().replace('\\', "/");
+            if cfg!(windows) { s.to_lowercase() } else { s }
+        });
+
         let sessions = page
             .items
             .into_iter()
@@ -479,10 +521,17 @@ impl Agent for CodexAgent {
                 let thread_id = item.thread_id?;
                 let item_cwd = item.cwd?;
 
-                if let Some(filter_cwd) = cwd.as_ref()
-                    && item_cwd != *filter_cwd
-                {
-                    return None;
+                if let Some(ref filter) = normalized_filter_cwd {
+                    let item_normalized = {
+                        let s = item_cwd.to_string_lossy().replace('\\', "/");
+                        if cfg!(windows) { s.to_lowercase() } else { s }
+                    };
+                    // Strip trailing slashes for consistent comparison
+                    let filter_trimmed = filter.trim_end_matches('/');
+                    let item_trimmed = item_normalized.trim_end_matches('/');
+                    if filter_trimmed != item_trimmed {
+                        return None;
+                    }
                 }
 
                 let title = item

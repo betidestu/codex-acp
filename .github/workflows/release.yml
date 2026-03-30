@@ -27,11 +27,13 @@ jobs:
 
       - name: Get version from Cargo.toml
         id: get_version
+        env:
+          INPUT_TAG_NAME: ${{ github.event.inputs.tag_name }}
         run: |
           VERSION=$(grep -m1 "^version" Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          if [ -n "${{ github.event.inputs.tag_name }}" ]; then
-            echo "tag_name=${{ github.event.inputs.tag_name }}" >> $GITHUB_OUTPUT
+          if [ -n "$INPUT_TAG_NAME" ]; then
+            echo "tag_name=$INPUT_TAG_NAME" >> $GITHUB_OUTPUT
           else
             echo "tag_name=v$VERSION" >> $GITHUB_OUTPUT
           fi
@@ -162,11 +164,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Clear global Rust flags so host/proc-macro builds don't pull in UBSan.
           echo "RUSTFLAGS=" >> "$GITHUB_ENV"
           echo "CARGO_ENCODED_RUSTFLAGS=" >> "$GITHUB_ENV"
           echo "RUSTDOCFLAGS=" >> "$GITHUB_ENV"
-          # Override any runner-level Cargo config rustflags as well.
           echo "CARGO_BUILD_RUSTFLAGS=" >> "$GITHUB_ENV"
           echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=" >> "$GITHUB_ENV"
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS=" >> "$GITHUB_ENV"
@@ -186,17 +186,15 @@ jobs:
           echo "CFLAGS=${cflags}" >> "$GITHUB_ENV"
           echo "CXXFLAGS=${cxxflags}" >> "$GITHUB_ENV"
 
-          # aws-lc-sys's jitterentropy C code picks up runner-injected
-          # UBSan flags through cmake in ways that are hard to fully
-          # suppress.  Disable jitterentropy entirely — the codex Bazel
-          # build does the same (see MODULE.bazel).
           echo "AWS_LC_SYS_NO_JITTER_ENTROPY=1" >> "$GITHUB_ENV"
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
+      # Code signing — only runs if the secrets are configured.
+      # Fork users: skip this by not setting these secrets (binaries will be unsigned).
       - name: Code sign macOS binary
-        if: startsWith(matrix.os, 'macos')
+        if: startsWith(matrix.os, 'macos') && env.MACOS_CERTIFICATE != ''
         env:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
@@ -207,7 +205,7 @@ jobs:
           ./script/sign-mac target/${{ matrix.target }}/release/codex-acp
 
       - name: Code sign Windows binary
-        if: startsWith(matrix.os, 'windows')
+        if: startsWith(matrix.os, 'windows') && env.AZURE_TENANT_ID != ''
         env:
           AZURE_TENANT_ID: ${{ secrets.AZURE_SIGNING_TENANT_ID }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_SIGNING_CLIENT_ID }}
@@ -249,125 +247,9 @@ jobs:
           path: ${{ steps.create_archive.outputs.archive_path }}
           retention-days: 1
 
-  npm-packages:
-    name: Create NPM Packages
-    needs: [get-version, build]
-    runs-on: ubuntu-latest
-    outputs:
-      packages: ${{ steps.create_packages.outputs.packages }}
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: "lts/*"
-          registry-url: "https://registry.npmjs.org"
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v5
-        with:
-          path: artifacts
-          merge-multiple: true
-
-      - name: Display structure of downloaded files
-        run: ls -la artifacts/
-
-      - name: Create platform-specific packages
-        run: bash npm/publish/create-platform-packages.sh ./artifacts ./npm-packages ${{ needs.get-version.outputs.version }}
-
-      - name: Update base package version
-        run: bash npm/publish/update-base-package.sh ${{ needs.get-version.outputs.version }}
-
-      - name: Upload NPM packages
-        uses: actions/upload-artifact@v4
-        with:
-          name: npm-packages
-          path: npm-packages/
-          retention-days: 1
-
-      - name: Upload base package
-        uses: actions/upload-artifact@v4
-        with:
-          name: npm-base-package
-          path: npm/
-          retention-days: 1
-
-  publish-npm-platform:
-    name: Publish NPM Platform Packages
-    needs: [get-version, npm-packages]
-    runs-on: ubuntu-latest
-    if: ${{ !github.event.repository.fork }}
-    environment: release # Optional: for enhanced security
-    permissions:
-      contents: read
-      id-token: write
-
-    steps:
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: "lts/*"
-          registry-url: "https://registry.npmjs.org"
-      - name: Update npm
-        run: npm install -g npm@latest
-
-      - name: Download NPM packages
-        uses: actions/download-artifact@v5
-        with:
-          name: npm-packages
-          path: npm-packages
-
-      - name: Publish platform packages
-        run: |
-          for pkg in npm-packages/*; do
-            if [ -d "$pkg" ]; then
-              echo "Publishing $(basename $pkg)..."
-              cd "$pkg"
-              npm publish
-              cd ../..
-            fi
-          done
-
-  publish-npm-base:
-    name: Publish NPM Base Package
-    needs: [get-version, npm-packages, publish-npm-platform]
-    runs-on: ubuntu-latest
-    if: ${{ !github.event.repository.fork }}
-    environment: release # Optional: for enhanced security
-    permissions:
-      contents: read
-      id-token: write
-
-    steps:
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: "lts/*"
-          registry-url: "https://registry.npmjs.org"
-      - name: Update npm
-        run: npm install -g npm@latest
-
-      - name: Download base package
-        uses: actions/download-artifact@v5
-        with:
-          name: npm-base-package
-          path: npm
-
-      - name: Wait for platform packages to be available
-        run: |
-          echo "Waiting 30 seconds for platform packages to be available on npm..."
-          sleep 30
-
-      - name: Publish base package
-        run: |
-          cd npm
-          npm publish
-
   create-release:
     name: Create Release
-    needs: [get-version, build, publish-npm-base]
+    needs: [get-version, build]
     runs-on: ubuntu-latest
 
     steps:
